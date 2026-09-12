@@ -1049,7 +1049,534 @@ local function DefineHandlers(comp)
     -- the 128-slot ring and pushes out weapon and footstep events, so only the
     -- leading edge of a shock is forwarded - a rising magnitude, or a fresh one
     -- after things went quiet. The decaying tail carries no new information.
-    local IMPULSE_MIN_MAG…6379 tokens truncated…restart proved
+    local IMPULSE_MIN_MAG  = 25.0   -- below this it isn't felt through a shaker
+    local IMPULSE_GAP      = 0.20   -- silence this long means a new shock
+    local IMPULSE_RISE     = 1.50   -- or this much stronger than the last sample
+
+    local impulseDiagCount = 0
+    local lastImpulseSeen  = 0
+    local lastImpulseMag   = 0
+
+    local function VecXYZ(v)
+        if v == nil then return 0, 0, 0 end
+        return ToNum(Unwrap(TryProp(v, "X"))),
+               ToNum(Unwrap(TryProp(v, "Y"))),
+               ToNum(Unwrap(TryProp(v, "Z")))
+    end
+
+    SafeHook("ImpulseReported", function(_self, impulseParams)
+        local p = Unwrap(impulseParams)
+        if p == nil then return end
+
+        local mag = ToNum(Field(p, "Impulse"))
+        if mag < IMPULSE_MIN_MAG then return end
+
+        -- Leading edge only; see the note above.
+        local now      = os.clock()
+        local wasQuiet = (now - lastImpulseSeen) > IMPULSE_GAP
+        local rising   = mag > lastImpulseMag * IMPULSE_RISE
+        lastImpulseSeen = now
+        lastImpulseMag  = mag
+        if not (wasQuiet or rising) then return end
+
+        local ix, iy, iz = VecXYZ(Unwrap(TryProp(p, "ImpulseVector")))
+        local len = math.sqrt(ix * ix + iy * iy + iz * iz)
+        if len > 0.0001 then
+            ix, iy, iz = ix / len, iy / len, iz / len
+        end
+
+        -- Mech axes. Falls back to world axes if these calls don't work; both return
+        -- a single FVector (24 bytes), well inside UE4SS's 512-byte call budget.
+        local fx, fy, fz = 1, 0, 0
+        local rx, ry, rz = 0, 1, 0
+        local okF, fwd = pcall(function() return comp.MechPawn:GetActorForwardVector() end)
+        local okR, rgt = pcall(function() return comp.MechPawn:GetActorRightVector() end)
+        if okF and fwd ~= nil then fx, fy, fz = VecXYZ(Unwrap(fwd)) end
+        if okR and rgt ~= nil then rx, ry, rz = VecXYZ(Unwrap(rgt)) end
+
+        -- Negated so positive = the impulse came FROM that direction.
+        local fromFwd   = -(ix * fx + iy * fy + iz * fz)
+        local fromRight = -(ix * rx + iy * ry + iz * rz)
+        local fromAbove = -iz
+
+        local dir
+        if math.abs(fromFwd) >= math.abs(fromRight) and math.abs(fromFwd) >= math.abs(fromAbove) then
+            dir = fromFwd >= 0 and 0 or 2       -- Front / Rear
+        elseif math.abs(fromRight) >= math.abs(fromAbove) then
+            dir = fromRight >= 0 and 1 or 3     -- Right / Left
+        else
+            dir = fromAbove >= 0 and 4 or 5     -- Above / Below
+        end
+
+        if DEBUG_LOG and impulseDiagCount < 5 then
+            impulseDiagCount = impulseDiagCount + 1
+            Log("Impulse: mag=%.1f vec=(%.2f,%.2f,%.2f) fwd=%.2f right=%.2f up=%.2f dir=%d axes=%s",
+                mag, ix, iy, iz, fromFwd, fromRight, fromAbove, dir,
+                (okF and okR) and "mech" or "WORLD-FALLBACK")
+        end
+
+        SendEvent(EV.Impulse, dir, mag, fromFwd, fromRight, fromAbove,
+                  ToNum(Field(p, "MinBreakImpulse")), 0)
+    end)
+
+    ----------------------------------------------------------------------------
+    -- Second component: MechAudioLogicComponent, on the mech pawn rather than the
+    -- PlayerController. Owns torso twist, jump jets and landing.
+    --
+    -- EVERY mech has one of these and the hooks match by function name, so all of
+    -- them arrive here - the player's and every AI's. Without the IsOurs() check
+    -- below, an enemy tracking a target across the arena drove our shaker, and
+    -- since several mechs' angles landed in the same lastYaw the differences came
+    -- out as nonsense (95 deg/s while standing perfectly still).
+    --
+    -- The PlayerController hooks don't need this: there is only one of those in a
+    -- single-player game, and DamageReported already filters by hit actor.
+    ----------------------------------------------------------------------------
+    -- Just a startup log, not a gate: IsOurs()/CurrentAudioComponent() below
+    -- already re-read comp.MechPawn.MechAudioComponent live on every call, with
+    -- their own self-healing cache, specifically so this doesn't need to be
+    -- valid yet. It used to be a gate - `return H` here, skipping every hook
+    -- from this point on (torso twist, jump jets, landed) - which was invisible
+    -- for as long as HookFeedbackComponent only ever ran after a human was
+    -- already sitting in a fully-possessed mech. The 20-36 auto-trigger runs
+    -- far earlier (as soon as the PlayerController exists), routinely catching
+    -- MechPawn still nil - and the gate then permanently dropped torso/jets/
+    -- landed for the whole mission, since nothing calls DefineHandlers again
+    -- once HookFeedbackComponent has already reported success.
+    local okAudioComp, audioComp = pcall(function() return comp.MechPawn.MechAudioComponent end)
+    if okAudioComp and audioComp and audioComp:IsValid() then
+        Log("MechAudioComponent: %s", SafeGetFullName(audioComp))
+    else
+        Log("comp.MechPawn.MechAudioComponent not ready yet (%s) - registering hooks anyway, " ..
+            "IsOurs() will self-heal once the mech is possessed.", tostring(audioComp))
+    end
+
+    -- IsOurs used to compare against a SNAPSHOT of audioComp taken once here. That
+    -- broke the moment the player's mech changed without a fresh F8: a new mission
+    -- swaps in a new PlayerController (comp itself goes stale, fixed by the
+    -- LoadMap-triggered auto-refresh below), but a mid-mission mech swap keeps the
+    -- same PlayerController and just changes comp.MechPawn - the snapshot never
+    -- saw that, so the new mech's OWN torso/jump-jet/landed events read as
+    -- "someone else's" and got silently filtered out. No vibration until F8.
+    --
+    -- Fix: re-read comp.MechPawn.MechAudioComponent live on every call instead of
+    -- caching it. `comp` itself stays valid across a mid-mission swap (it hangs
+    -- off the PlayerController, not the pawn), so this always reflects whichever
+    -- mech is current. Address comparison is tried first since GetFullName on
+    -- every call (this fires ~20/sec per mech in the arena) would be too costly.
+    -- Re-resolving on every call was correct but wasteful: this can run into the
+    -- thousands/sec (raw OnTorsoTwist, not the debounced rate, across every mech in
+    -- the arena). A mech swap doesn't happen more than once every few seconds at
+    -- most, so a short TTL cache cuts the property-chain walk by >95% while still
+    -- self-healing well within the time it'd take anyone to notice.
+    local CACHE_TTL = 0.5
+    local cachedAudioComp = nil
+    local cachedAt = 0
+
+    local function CurrentAudioComponent()
+        local now = os.clock()
+        if cachedAudioComp ~= nil and (now - cachedAt) < CACHE_TTL then
+            return cachedAudioComp
+        end
+        local ok, ac = pcall(function() return comp.MechPawn.MechAudioComponent end)
+        cachedAt = now
+        cachedAudioComp = (ok and ac ~= nil) and ac or nil
+        return cachedAudioComp
+    end
+
+    local function IsOurs(selfObj)
+        local s = Unwrap(selfObj)
+        if s == nil then return false end
+
+        local ac = CurrentAudioComponent()
+        if ac == nil then return false end
+        if s == ac then return true end
+
+        local okA, sAddr = pcall(function() return s:GetAddress() end)
+        local okB, acAddr = pcall(function() return ac:GetAddress() end)
+        if okA and okB then return sAddr == acAddr end
+
+        return SafeGetFullName(s) == SafeGetFullName(ac)
+    end
+
+    -- JumpJets(9): Int0 = Active.
+    --
+    -- UMWJumpJetComponent reports the real state, and only Active means the jets
+    -- are actually burning (MechWarrior_enums.hpp:534):
+    --     0 Inactive   1 Warmup   2 Active   3 Cooldown
+    --
+    -- This is the reliable source. MechAudioComponent's JumpJetEvent/StopEvent pair
+    -- up when the jets are tapped, but holding them until the fuel runs out sent
+    -- 1,1 and never a stop - latching the channel on for good. Those two are kept
+    -- only as a fallback for if the state hook never fires.
+    -- Same live-read fix as IsOurs above - comp.MechPawn is read fresh rather than
+    -- snapshotted, so a mid-mission mech swap doesn't leave this pointing at the
+    -- mech that used to be current.
+    local function IsOurJetComp(selfObj)
+        local s = Unwrap(selfObj)
+        if s == nil then return false end
+        local okPawn, pawn = pcall(function() return comp.MechPawn end)
+        if not okPawn or pawn == nil then return false end
+        -- GetOwner returns a pointer, so it's well inside the 512-byte call limit.
+        local ok, owner = pcall(function() return s:GetOwner() end)
+        if not ok or owner == nil then return false end
+        return SameObject(Unwrap(owner), pawn)
+    end
+
+    -- Jets are driven by polling EJumpJetState, not by a hook.
+    --
+    -- Three hook attempts all failed. JumpJetStateChange is a delegate SIGNATURE
+    -- (FMWJumpJetComponentOnJumpJetStateChange), not a function the engine calls -
+    -- registering it succeeds and achieves nothing. Start/ShutdownJumpJets and their
+    -- On* spellings are real methods on UMWJumpJetComponent and never fired either,
+    -- so the component simply isn't reachable through custom events.
+    --
+    -- Reading the property has none of those problems; it just needs a clock.
+    -- JumpJetEvent is a reliable START signal (only the stop half goes missing), so
+    -- polling begins there and stops itself once the jets go Inactive - nothing
+    -- ticks while the mech is walking around.
+    local JET_POLL_MS   = 40
+    local jetComp       = nil
+    local jetPolling    = false
+    local lastJetActive = nil
+
+    local function PollJetState()
+        if not jetPolling or jetComp == nil then return end
+
+        local st     = ToInt(Unwrap(TryProp(jetComp, "JumpJetState")))
+        local active = (st == 2) and 1 or 0   -- 2 = Active, the only burning state
+
+        if active ~= lastJetActive then
+            lastJetActive = active
+            SendEvent(EV.JumpJets, active, 0, 0, 0, 0, 0, 0)
+        end
+
+        -- Warmup and Cooldown still lead somewhere; Inactive is the end of it.
+        if st == 0 then
+            jetPolling = false
+            return
+        end
+        ExecuteWithDelay(JET_POLL_MS, PollJetState)
+    end
+
+    local function StartJetPolling()
+        -- Re-resolved every call, not cached past the first success: this only
+        -- runs once per jump-jet trigger pull, so the cost is trivial, and caching
+        -- it permanently was the same staleness bug as IsOurs/IsOurJetComp above -
+        -- after a mid-mission mech swap it would keep polling the OLD mech's jets.
+        local okJet, c = pcall(function()
+            return comp.MechPawn.MechAudioComponent.JumpJetComponent
+        end)
+        if not okJet or c == nil then
+            Log("JumpJetComponent unreachable (%s) - falling back to events.", tostring(c))
+            return false
+        end
+        if jetComp ~= c then
+            jetComp = c
+            Log("JumpJetComponent: %s", SafeGetFullName(jetComp))
+        end
+
+        if not jetPolling then
+            jetPolling    = true
+            lastJetActive = nil
+            PollJetState()
+        end
+        return true
+    end
+
+    SafeHook("JumpJetEvent", function(_self)
+        if not IsOurs(_self) then return end
+
+        -- Polling owns the channel once it's running; only fall back to the raw
+        -- event if the component can't be reached.
+        if StartJetPolling() then return end
+        SendEvent(EV.JumpJets, 1, 0, 0, 0, 0, 0, 0)
+    end)
+    SafeHook("JumpJetStopEvent", function(_self)
+        if jetPolling then return end
+        if not IsOurs(_self) then return end
+        SendEvent(EV.JumpJets, 0, 0, 0, 0, 0, 0, 0)
+    end)
+
+    -- Landed(11): Int0 = MassInTons, Float0 = AccelerationInKmh2.
+    -- ImpactAcceleration is an FVector in Unreal units (cm/s^2). The exact scale the
+    -- original engine expected isn't documented anywhere we have, so this logs the
+    -- raw magnitude alongside what it sends - compare against a real landing and
+    -- adjust the factor if the shake feels wrong.
+    SafeHook("OnLandedCollision", function(_self, hit, impactAcceleration, impactVelocity)
+        if not IsOurs(_self) then return end
+        local a = Unwrap(impactAcceleration)
+        local mag = 0
+        if a then
+            local okv, v = pcall(function()
+                return math.sqrt((a.X or 0) ^ 2 + (a.Y or 0) ^ 2 + (a.Z or 0) ^ 2)
+            end)
+            if okv then mag = v end
+        end
+        if DEBUG_LOG then
+            Log("OnLandedCollision: |ImpactAcceleration|=%.1f (cm/s^2, verify scale)", mag)
+        end
+        SendEvent(EV.Landed, GetTons(comp), mag * CMS_TO_KMH, 0, 0, 0, 0, 0)
+    end)
+
+    -- TorsoTwist(1): Int0 = MassInTons, Float1 = SpeedInKmh,
+    --                Float2/3 = yaw/pitch angular velocity, Float4/5 = yaw/pitch
+    --
+    -- Fires ~5x per game tick, so it MUST be rate-limited: at 60fps that's 300
+    -- events/sec, which would refill the 128-slot ring buffer every 0.4s and push
+    -- out every weapon and damage event. Debounced to TORSO_TWIST_INTERVAL.
+    --
+    -- os.clock() is wall-clock time on Windows (MSVC defines it as elapsed time
+    -- since process start), which is what we want - not CPU time.
+    --
+    -- PROTOCOL NOTE: the original put MaxYawRate/MaxPitchRate in Float2/Float3 and
+    -- expected the reader to difference Yaw/Pitch itself. Here Float2/Float3 carry
+    -- the ACTUAL angular rates in deg/s, and the SimHub plugin normalises them
+    -- against a configurable reference rate.
+    --
+    -- FTorsoTwistFrame exposes YawVelocity/PitchVelocity, but measured against the
+    -- angles they don't line up: over a 50ms window Yaw moved 10.28 -> 13.66 (about
+    -- 67 deg/s) while YawVelocity read 0.060. Whatever unit that is, it isn't deg/s,
+    -- so the rate is differenced from the angles instead - the same thing the
+    -- original TorsoTwist.cs does.
+    local lastTwistAt = 0
+    local lastYaw, lastPitch = 0, 0
+    -- The consumer holds the last level until a new one arrives, so coming to a
+    -- stop has to be announced. Without this the shaker keeps buzzing forever.
+    local twistActive = false
+    local lastTwistLogAt = 0
+
+    SafeHook("OnTorsoTwist", function(_self, torso, leftArm, rightArm)
+        -- Before the debounce: an enemy's event would otherwise consume our slot.
+        if not IsOurs(_self) then return end
+
+        local now = os.clock()
+        local dt  = now - lastTwistAt
+        if dt < TORSO_TWIST_INTERVAL then return end
+
+        local yaw   = ToNum(Field(torso, "Yaw"))
+        local pitch = ToNum(Field(torso, "Pitch"))
+
+        local yawRate, pitchRate = 0, 0
+
+        -- Skip the very first sample, and any gap long enough that the mech could
+        -- have swung anywhere in between (mission load, reconnect).
+        if lastTwistAt > 0 and dt > 0 and dt < 0.5 then
+            local dYaw = yaw - lastYaw
+            -- Guard against wrap-around if the angle is ever reported as -180..180.
+            if dYaw >  180 then dYaw = dYaw - 360 end
+            if dYaw < -180 then dYaw = dYaw + 360 end
+
+            yawRate   = math.abs(dYaw) / dt
+            pitchRate = math.abs(pitch - lastPitch) / dt
+        end
+
+        lastTwistAt = now
+        lastYaw     = yaw
+        lastPitch   = pitch
+
+        -- Diagnostic, once a second. Kept while the deadzone is being tuned - the
+        -- rate is the only way to tell deliberate aiming from the post-shot drift.
+        if DEBUG_LOG and now - lastTwistLogAt > 1.0 then
+            lastTwistLogAt = now
+            Log("TorsoTwist: yaw=%.2f pitch=%.2f  yawRate=%.2f pitchRate=%.2f  sending=%s",
+                yaw, pitch, yawRate, pitchRate,
+                (yawRate >= TORSO_TWIST_MIN_RATE or pitchRate >= TORSO_TWIST_MIN_RATE) and "YES" or "no")
+        end
+
+        -- Nothing to feel when the torso is still. Send one zero to close out a
+        -- movement that just ended, then stay quiet until it starts again.
+        if yawRate < TORSO_TWIST_MIN_RATE and pitchRate < TORSO_TWIST_MIN_RATE then
+            if twistActive then
+                twistActive = false
+                SendEvent(EV.TorsoTwist, GetTons(comp), 0, GetSpeedKmh(comp),
+                          0, 0, yaw, pitch)
+            end
+            return
+        end
+        twistActive = true
+
+        SendEvent(EV.TorsoTwist, GetTons(comp),
+                  0,                     -- Float0: DeltaSeconds (unused)
+                  GetSpeedKmh(comp),     -- Float1
+                  yawRate, pitchRate,    -- Float2/3: deg/s, differenced from angles
+                  yaw, pitch)            -- Float4/5
+    end)
+
+    return H
+end
+
+--------------------------------------------------------------------------------
+-- Hook installation
+--------------------------------------------------------------------------------
+
+-- Installs one hook per event, once per game session. Each hook looks the handler
+-- up at call time, so an F6 reload swaps the behaviour without re-registering -
+-- which is what keeps the hang out of the picture, since nothing ever unhooks.
+-- Tracked per event name rather than with a single flag: DefineHandlers returns
+-- early if the mech's audio component isn't reachable yet (F8 pressed before a
+-- mech exists), so the torso/jets handlers can appear on a later call. A single
+-- "installed" flag would lock those out forever.
+local function InstallHooks()
+    MSP.hooked = MSP.hooked or {}
+
+    local added, failed = 0, 0
+    for name in pairs(MSP.H) do
+        if not MSP.hooked[name] then
+            local eventName = name
+            local ok, err = pcall(function()
+                RegisterCustomEvent(eventName, function(...)
+                    local handler = MSP.H[eventName]
+                    if handler then return handler(...) end
+                end)
+            end)
+            if ok then
+                MSP.hooked[eventName] = true
+                added = added + 1
+            else
+                failed = failed + 1
+                Log("RegisterCustomEvent(%s) FAILED: %s", eventName, tostring(err))
+            end
+        end
+    end
+
+    local total = 0
+    for _ in pairs(MSP.hooked) do total = total + 1 end
+    if added > 0 or failed > 0 then
+        Log("Hooks: %d newly installed, %d failed, %d active.", added, failed, total)
+    else
+        Log("Hooks: %d already active, handlers refreshed.", total)
+    end
+end
+
+-- Finds the components, (re)builds the handlers and installs the hooks if needed.
+-- Safe to call repeatedly: F8 on a new mission just refreshes the captured
+-- component references.
+local function HookFeedbackComponent()
+    local ok, pc = pcall(UEHelpers.GetPlayerController)
+    if not ok or not pc or not pc:IsValid() then
+        Log("No valid PlayerController yet - are you in a mission?")
+        return false
+    end
+
+    local okComp, comp = pcall(function() return pc.ControllerFeedbackComponent end)
+    if not okComp or not comp or not comp:IsValid() then
+        Log("pc.ControllerFeedbackComponent failed: %s", tostring(comp))
+        return false
+    end
+    Log("ControllerFeedbackComponent: %s", SafeGetFullName(comp))
+
+    MSP.comp = comp
+    MSP.H    = DefineHandlers(comp)
+    InstallHooks()
+    return true
+end
+
+--------------------------------------------------------------------------------
+-- Keybinds
+--------------------------------------------------------------------------------
+
+local function DumpPlayerControllerInfo()
+    local ok, pc = pcall(UEHelpers.GetPlayerController)
+    if not ok or not pc or not pc:IsValid() then
+        Log("No valid PlayerController yet - are you in a mission?")
+        return
+    end
+    Log("PlayerController: %s", SafeGetFullName(pc))
+    Log("Bridge pipe: %s", MSP.pipe and "connected" or "NOT connected")
+
+    local handlers, hooks = 0, 0
+    if MSP.H      then for _ in pairs(MSP.H)      do handlers = handlers + 1 end end
+    if MSP.hooked then for _ in pairs(MSP.hooked) do hooks    = hooks + 1    end end
+    Log("Handlers: %d   Hooks active: %d", handlers, hooks)
+end
+
+-- Diagnostic: log every level transition. A fatal crash (2026-08-26, engine
+-- ACCESS_VIOLATION, cause unconfirmed) happened ~45s after the last logged
+-- gameplay event, with CheatManagerEnabler re-constructing in between - which
+-- normally means a new level/world was spawned. This turns that guess into a
+-- timestamped fact: if a real crash follows a "LoadMap Pre" with no matching
+-- "Post", the transition itself is implicated rather than whatever was firing
+-- at the time. Not RegisterCustomEvent, so it doesn't dedupe on its own - guard
+-- with the same one-time flag pattern as the keybinds below.
+if not MSP.levelHooksDone then
+    MSP.levelHooksDone = true
+
+    RegisterLoadMapPreHook(function(_engine, _worldContext, url)
+        local u = ""
+        pcall(function() u = tostring(Unwrap(url)) end)
+        Log("LoadMap PRE: url=%s", u)
+    end)
+    -- A new mission (or a mech swap that reloads the arena) spawns a fresh
+    -- PlayerController and MechAudioComponent, but IsOurs()/IsOurJetComp() were
+    -- still comparing against the ones captured the last time F8 ran - so the new
+    -- mech's own torso/jump jet/landed events read as "someone else's" and got
+    -- filtered out. Symptom: no torso vibration after starting a mission or
+    -- swapping mechs, until F8 is pressed by hand. Auto-refresh here instead.
+    --
+    -- The controller/pawn may not be possessed yet the instant LoadMap returns, so
+    -- this retries on a short timer rather than assuming one attempt is enough.
+    -- 6 attempts (2.5s) was plenty for a mission-to-mission transition inside an
+    -- already-running game (the original 20-26 case), but nowhere near enough
+    -- for the fresh-boot-straight-into-a-mission case added in 20-36: the whole
+    -- game is still starting up, and the PlayerController can easily take much
+    -- longer than 2.5s to become valid. 60 attempts (30s) was tried first and
+    -- still wasn't enough - logs from an actual cold boot (20-41) showed
+    -- pc.ControllerFeedbackComponent returning a bogus "TrivialObject" (hangar/
+    -- loadout screen, presumably) for 26 of those seconds, then the real mission
+    -- component only resolved 3+ minutes after launch - well past any fixed
+    -- 30s-scale budget, because that time is however long the player spends
+    -- navigating menus before dropping into the mission, which has no upper
+    -- bound. Each attempt is one cheap property check, so there's no real cost
+    -- to a much longer budget - 600 attempts (5 minutes) here; still gives up
+    -- eventually rather than polling forever if genuinely stuck at a menu.
+    local refreshAttempt = 0
+    local function RefreshAfterLevelLoad()
+        refreshAttempt = refreshAttempt + 1
+        if HookFeedbackComponent() then
+            Log("Auto-refresh after level load: OK (attempt %d)", refreshAttempt)
+            return
+        end
+        if refreshAttempt < 600 then
+            ExecuteWithDelay(500, RefreshAfterLevelLoad)
+        else
+            Log("Auto-refresh after level load: gave up after %d attempts " ..
+                "(probably not in a mission - e.g. main menu)", refreshAttempt)
+        end
+    end
+
+    RegisterLoadMapPostHook(function(_engine, _worldContext, url)
+        local u = ""
+        pcall(function() u = tostring(Unwrap(url)) end)
+        Log("LoadMap POST: url=%s", u)
+
+        refreshAttempt = 0
+        ExecuteWithDelay(500, RefreshAfterLevelLoad)
+    end)
+
+    -- A real trigger for the cold-boot-straight-into-a-mission gap, instead of
+    -- blindly polling from the moment the script loads: AMWPlayerController's
+    -- OnPossessesPawn delegate fires when the controller takes control of its
+    -- mech (SDK dump: MechWarrior.hpp, AMWPlayerController). In practice it
+    -- never fired in testing - the possess for a mission the game boots
+    -- straight into happens too early, before this script finishes loading
+    -- and gets the registration in, so there's nothing left here to catch by
+    -- the time we're listening. Left in anyway (harmless, and might catch a
+    -- later possess - a mech swap mid-mission, say) as a faster path when it
+    -- does fire, but it can't be the only mechanism.
+    local ok, err = pcall(function()
+        RegisterCustomEvent("OnPossessesPawn", function(_self, pawn)
+            Log("OnPossessesPawn fired - refreshing hooks.")
+            HookFeedbackComponent()
+        end)
+    end)
+    if not ok then
+        Log("RegisterCustomEvent(OnPossessesPawn) FAILED: %s", tostring(err))
+    end
+
+    -- 20-43: "Restart mission" from the in-game menu doesn't fire LoadMap at
+    -- all (it resets actors in place, no travel) and torso twist went silent
+    -- again after one - 3 minutes of total log silence post-restart proved
     -- neither LoadMap POST nor OnPossessesPawn ever fired for it. Found the
     -- real trigger by reading CheatManagerEnablerMod's own source (a
     -- different UE4SS mod, but it needs the same "possession re-established"
